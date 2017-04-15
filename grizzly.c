@@ -10,6 +10,7 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <string.h>
@@ -35,6 +36,7 @@ typedef struct editorConfig{
 	int rx;
 	int numrows;
 	int rowoff, coloff;
+	int dirty;
 }editorConfig;
 
 typedef struct abuf{
@@ -42,7 +44,7 @@ typedef struct abuf{
 	int len;
 }abuf;
 
-/*** function defs ***/
+/*** prototypes ***/
 void disableRawMode();
 void enableRawMode();
 void die(const char *s);
@@ -62,6 +64,10 @@ int editorRowCxToRx(erow* row, int cx);
 void editorDrawStatusBar(abuf* ab);
 void editorSetStatusMessage(const char* fmt, ...);
 void editorDrawMessageBar(abuf* ab);
+void editorRowInsertChar(erow* row, int at, int c);
+void editorInsertChar(int c);
+void editorSave();
+char* editorRowsToString(int* buflen);
 
 /*** globals ***/
 editorConfig E;
@@ -69,19 +75,21 @@ editorConfig E;
 /*** definitions ***/
 #define CTRL_KEY(k) ((k) & 0x1f)
 #define ABUF_INIT {NULL, 0}
-#define KILO_VERSION "0.0.1"
-#define KILO_TAB_STOP 4
+#define GRIZZLY_VERSION "0.0.1"
+#define GRIZZLY_TAB_STOP 4
+#define GRIZZLY_QUIT_TIMES 3
 
 enum editorKey {
-  ARROW_LEFT = 1000,
-  ARROW_RIGHT,
-  ARROW_UP,
-  ARROW_DOWN,
-  DEL_KEY,
-  HOME_KEY,
-  END_KEY,
-  PAGE_UP,
-  PAGE_DOWN
+	BACKSPACE = 127,
+	ARROW_LEFT = 1000,
+	ARROW_RIGHT,
+	ARROW_UP,
+	ARROW_DOWN,
+	DEL_KEY,
+	HOME_KEY,
+	END_KEY,
+	PAGE_UP,
+	PAGE_DOWN
 };
 
 /*** init ***/
@@ -91,7 +99,7 @@ int main(int argc, char* argv[]){
 	if(argc >= 2)
 		editorOpen(argv[1]);
 
-	editorSetStatusMessage("HELP: Ctrl-Q = quit");
+	editorSetStatusMessage("HELP:  Ctrl-S = save | Ctrl-Q = quit");
 
 	while(1){ //infinite loop
 		editorProcessKeypress();
@@ -111,6 +119,7 @@ void initEditor(){
 	E.filename = NULL;
 	E.statusmsg[0] = '\0';
 	E.statusmsg_time = 0;
+	E.dirty = 0;
 
 	if(getWindowSize(&E.screenrows, &E.screencols) == -1)
 		die("getWindowSize");
@@ -233,13 +242,29 @@ void editorMoveCursor(int key) {
 }
 
 void  editorProcessKeypress(){
+	static int quit_times = GRIZZLY_QUIT_TIMES;
+
 	int c = editorReadKey();
 
 	switch(c){
+		case '\r':
+			/* TODO */
+			break;
+
 		case CTRL_KEY('q'):
+			if(E.dirty && quit_times > 0){
+				editorSetStatusMessage("WARNING! File has unsaved changes. "
+					"Press Ctrl-Q %d more times to quit.", quit_times);
+				quit_times--;
+				return;
+			}
 			write(STDOUT_FILENO, "\x1b[2J", 4);
   			write(STDOUT_FILENO, "\x1b[H", 3);
 			exit(0);
+			break;
+
+		case CTRL_KEY('s'):
+			editorSave();
 			break;
 
 		case HOME_KEY:
@@ -249,6 +274,12 @@ void  editorProcessKeypress(){
 			if(E.cy < E.numrows) //if row exists
 				E.cx = E.row[E.cy].size;
 			break;
+
+		case BACKSPACE:
+		case CTRL_KEY('h'):
+		case DEL_KEY:
+			/* TODO */
+		break;
 
 		case PAGE_UP:
 		case PAGE_DOWN:
@@ -262,13 +293,24 @@ void  editorProcessKeypress(){
 			}
 		}
 			break;
+
 		case ARROW_UP:
 		case ARROW_DOWN:
 		case ARROW_RIGHT:
 		case ARROW_LEFT:
 			editorMoveCursor(c);
 			break;
+
+		case CTRL_KEY('l'):
+		case '\x1b':
+			break;
+
+		default:
+			editorInsertChar(c);
+			break;
 	}
+
+	quit_times = GRIZZLY_QUIT_TIMES;
 }
 
 int editorReadKey(){
@@ -372,8 +414,9 @@ void editorDrawStatusBar(abuf* ab){
 	abAppend(ab, "\x1b[7m", 4);
 	char status[80], rstatus[80];
 
-	int len = snprintf(status, sizeof(status), "%.20s - %d lines",
-		E.filename ? E.filename : "[No Name]", E.numrows);
+	int len = snprintf(status, sizeof(status), "%.20s - %d lines %s",
+		E.filename ? E.filename : "[No Name]", E.numrows
+		, E.dirty ? "(modified)" : "");
 	int rlen = snprintf(rstatus, sizeof(rstatus), "%d/%d",
 		E.cy + 1, E.numrows);
 	if(len > E.screencols)
@@ -411,7 +454,7 @@ void editorDrawRows(abuf* ab){
 			if(E.numrows == 0 && y == E.screenrows / 3){
 				char welcome[80];
 				int  welcomelen = snprintf(welcome, sizeof(welcome),
-					"Kilo Editor -- version %s", KILO_VERSION);
+					"GrizzlyText -- version %s", GRIZZLY_VERSION);
 				int padding;
 				if(welcomelen > E.screencols)
 					welcomelen = E.screencols;
@@ -458,6 +501,48 @@ void editorOpen(char* filename){
 	}
 	free(line);
 	fclose(fp);
+	E.dirty = 0;
+}
+
+void editorSave(){
+	if(E.filename == NULL)
+		return;
+
+	int len;
+	char* buf = editorRowsToString(&len);
+
+	int fd = open(E.filename, O_RDWR | O_CREAT, 0644);
+	if(fd != -1){
+		if(ftruncate(fd, len) != -1)
+			if(write(fd, buf, len) == len){
+				close(fd);
+				free(buf);
+				E.dirty = 0;
+				editorSetStatusMessage("%d bytes written to the disk", len);
+				return;
+			}
+		close(fd);
+	}
+	free(buf);
+	editorSetStatusMessage("Can't save! I/O error: %s", strerror(errno));
+}
+
+char* editorRowsToString(int* buflen){
+	int totlen = 0;
+	int j;
+	for(j = 0; j < E.numrows; j++)
+		totlen += E.row[j].size + 1;
+	*buflen = totlen;
+
+	char* buf = malloc(totlen);
+	char* p = buf;
+	for(j = 0; j < E.numrows; j++){
+		memcpy(p, E.row[j].chars, E.row[j].size);
+		p += E.row[j].size;
+		*p = '\n';
+		p++;
+	}
+	return buf;
 }
 
 /*** row ops***/
@@ -475,6 +560,7 @@ void editorAppendRow(char* s, size_t len){
 	editorUpdateRow(&E.row[at]); //set render
 
 	E.numrows++;
+	E.dirty++;
 }
 
 void editorUpdateRow(erow* row){
@@ -485,13 +571,13 @@ void editorUpdateRow(erow* row){
 			tabs++;
 
 	free(row->render); //reset mem
-	row->render = malloc(row->size + tabs*(KILO_TAB_STOP - 1) + 1); //reallocate
+	row->render = malloc(row->size + tabs*(GRIZZLY_TAB_STOP - 1) + 1); //reallocate
 
 	int idx = 0;
 	for(j = 0; j < row->size; j++){
 		if(row->chars[j] == '\t'){
 			row->render[idx++] = ' ';
-			while(idx % KILO_TAB_STOP != 0)
+			while(idx % GRIZZLY_TAB_STOP != 0)
 				row->render[idx++] = ' ';
 		}
 		else
@@ -506,8 +592,29 @@ int editorRowCxToRx(erow* row, int cx){
 	int j;
 	for(j = 0; j < cx; j++){ //0 to cursor
 		if(row->chars[j] == '\t')
-			rx += (KILO_TAB_STOP - 1) - (rx % KILO_TAB_STOP);
+			rx += (GRIZZLY_TAB_STOP - 1) - (rx % GRIZZLY_TAB_STOP);
 		rx++;
 	}
 	return rx;
+}
+
+void editorRowInsertChar(erow* row, int at, int c){
+	if (at < 0 || at > row->size)
+		at = row->size;
+	row->chars = realloc(row->chars, row->size + 2);
+	memmove(&row->chars[at + 1], &row->chars[at], row->size - at + 1);
+	row->size++;
+	row->chars[at] = c;
+	editorUpdateRow(row);
+	E.dirty++;
+}
+
+/*** editor ops ***/
+void editorInsertChar(int c){
+	if (E.cy == E.numrows){ //last line
+		editorAppendRow("", 0);
+	}
+	//row at E.cy, position in row, char to write
+	editorRowInsertChar(&E.row[E.cy], E.cx, c);
+	E.cx++; //increment cursor position
 }

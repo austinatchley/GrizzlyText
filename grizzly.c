@@ -68,6 +68,8 @@ void editorRowInsertChar(erow* row, int at, int c);
 void editorInsertChar(int c);
 void editorSave();
 char* editorRowsToString(int* buflen);
+void editorRowDelChar(erow* row, int at);
+void editorDelChar();
 
 /*** globals ***/
 editorConfig E;
@@ -278,8 +280,10 @@ void  editorProcessKeypress(){
 		case BACKSPACE:
 		case CTRL_KEY('h'):
 		case DEL_KEY:
-			/* TODO */
-		break;
+			if (c == DEL_KEY) 
+				editorMoveCursor(ARROW_RIGHT);
+      		editorDelChar();
+			break;
 
 		case PAGE_UP:
 		case PAGE_DOWN:
@@ -561,6 +565,25 @@ void editorAppendRow(char* s, size_t len){
 
 	E.numrows++;
 	E.dirty++;
+}
+
+void editorRowDelChar(erow* row, int at){
+	if(at < 0 || at >= row->size)
+		return;
+	memmove(&row->chars[at], &row->chars[at+1], row->size - at);
+	row->size--;
+	editorUpdateRow(row);
+	E.dirty++;
+}
+
+void editorDelChar() {
+  if (E.cy == E.numrows)
+  	return;
+  erow *row = &E.row[E.cy];
+  if (E.cx > 0) {
+    editorRowDelChar(row, E.cx - 1);
+    E.cx--;
+  }
 }
 
 void editorUpdateRow(erow* row){
